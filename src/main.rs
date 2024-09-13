@@ -5,13 +5,15 @@ use panic_halt as _;
 
 use cortex_m_rt::entry;
 use core::{
+    f32::consts::PI,
     cell::{Cell, RefCell},
     fmt::Write,
 };
 use cortex_m::interrupt::Mutex;
 use rp2040_pac::{interrupt, UART0, UART1};
 
-use heapless::String;
+use heapless::{Vec, String};
+use micromath::F32Ext;
 
 #[link_section = ".boot2"]
 #[used]
@@ -198,10 +200,12 @@ fn main() -> ! {
 
     io_bank0.gpio(1).gpio_ctrl().modify(|_, w| w.funcsel().uart());
 
-
     // Buffers
     let gpsbuf = String::new();// buffer to hold gps data
     let serialbuf = &mut String::<164>::new();// buffer to hold data to be serially transmitted
+
+    // Variables
+    let (mut theta, mut phi) = (0., 0.);
 
     // Tests
     writeln!(serialbuf, "\nUart command test.").unwrap();
@@ -209,6 +213,8 @@ fn main() -> ! {
 
     writeln!(serialbuf, "\nUart data test.\n").unwrap();
     transmit_uart_data(&uart_data, serialbuf);
+
+    let mut position = Position::new();// gps position struct
 
     // Move peripherals into global scope
     cortex_m::interrupt::free(|cs| {
@@ -229,41 +235,68 @@ fn main() -> ! {
     loop {
         cortex_m::interrupt::free(|cs| {
             let mut direction = DIRECTION.borrow(cs).borrow_mut();
-            let mut uart_cmd = UARTCMD.borrow(cs).borrow_mut();
+            let mut uart_data = UARTDATA.borrow(cs).borrow_mut();
+            let mut buffer = BUFFER.borrow(cs).borrow_mut();
 
             if AUTO.borrow(cs).get() {
                 // Auto mode
-                writeln!(serialbuf, "auto mode").unwrap();
-                transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                if GGA_ACQUIRED.borrow(cs).get() {
+                    // Transmit raw data from gps
+                    write!(serialbuf, "\n{}", buffer.as_mut().unwrap()).unwrap(); 
+                    transmit_uart_data(
+                        uart_data.as_mut().unwrap(),
+                        serialbuf);
+                    GGA_ACQUIRED.borrow(cs).set(false);// clear the flag
+
+                    // update the coordinates from the nmea sentence
+                    parse_gga(buffer.as_mut().unwrap(), &mut position);
+
+                    // Transmit gps position
+                    let lat = position.lat;
+                    let long = position.long;
+                    writeln!(serialbuf, "lat: {}  long: {}", lat, long).unwrap();
+                    transmit_uart_data(
+                        uart_data.as_mut().unwrap(),
+                        serialbuf);
+
+                    // Calculate look angles
+                    (theta, phi) = get_look_angles(
+                        position.lat,
+                        position.long,
+                        position.alt);
+
+                    writeln!(serialbuf, "theta: {}  phi: {}", theta, phi).unwrap();
+                    transmit_uart_data(
+                        uart_data.as_mut().unwrap(),
+                        serialbuf);
+                }
             } else {
                 // Manual mode
-                writeln!(serialbuf, "manual mode").unwrap();
-                transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
                 match direction.as_mut() {
                     Some(Direction::Cw) => {
                         *direction = None;// reset direction
                         writeln!(serialbuf, "manual mode: cw").unwrap();
-                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     Some(Direction::Ccw) => {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: ccw").unwrap();
-                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     Some(Direction::Up) => {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: up").unwrap();
-                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     Some(Direction::Down) => {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: down").unwrap();
-                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     Some(Direction::Zero) => {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: position zero").unwrap();
-                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     None => {},
                 }
@@ -304,6 +337,87 @@ fn transmit_uart_data(uart: &UART0, buffer: &mut String<164>) {
     buffer.clear()
 }
 
+fn parse_gga(buffer: &mut String<164>, position: &mut Position) {
+    //  Updates position of earth station
+    let v : Vec<&str, 84> = buffer.split_terminator(',').collect();
+
+    if !v[2].is_empty() {// latitude
+        let (x, y) = v[2].split_at(2);
+
+        let x_f32 = x.parse::<f32>().unwrap_or(0.);
+
+        let y_f32 = y.parse::<f32>().unwrap_or(0.);
+
+        if x_f32 + (y_f32/60.) != 0. {// if reading valid i.e. != 0 update position
+            position.lat = x_f32 + (y_f32/60.);
+
+            if v[3] == "S" {
+                position.lat *= -1.;
+            }
+        }
+
+        if !v[4].is_empty() {
+            let (a, b) = v[4].split_at(3);
+
+            let a_f32 = a.parse::<f32>().unwrap_or(0.);
+
+            let b_f32 = b.parse::<f32>().unwrap_or(0.);
+
+            if a_f32 + (b_f32/60.) != 0. {
+                position.long = a_f32 + (b_f32/60.);// if reading valid i.e. != 0 update position
+
+                if v[5] == "W" {
+                    position.long *= -1.;
+                }
+            }
+
+            if !v[9].is_empty()  {
+                let c = v[9];
+                position.alt = match c.parse::<f32>() {
+                    Ok(c) => c,
+                    Err(_) => position.lat,// replace w/ last position
+                };
+            }
+        }
+    }
+}
+
+fn get_look_angles(lat: f32, long: f32, alt: f32) -> (f32, f32) {
+    // Earth Station in radians
+    let le: f32 = lat*PI/180.; // Latitude: N +ve, S -ve??
+    let ie: f32 = long*PI/180.; // Longitude: E +ve, W -ve??
+    let _h: f32 = alt; // Altitude
+
+    // Satellite position in radians
+    const _LS: f32 = 0.;// Latitude
+    const IS: f32 = 50.*PI/180.;// Longitude
+
+    // Determine Differential Longitude, b
+    let b = ie - IS;
+
+    let mut theta = (((le.cos()*b.cos())-0.151)/(1.-(le.cos()*le.cos()*b.cos()*b.cos())).sqrt()).atan();
+    let mut ai = (b.tan()/le.sin()).atan();
+
+    // Convert into Deg.
+    theta *= 180.0/PI;
+    ai *= 180./PI;
+
+    // Azimuth Angle
+    let phi_z = {
+        if (le < 0.) && (b > 0.) {
+            360. - ai
+        } else if (le > 0.) && (b < 0.) {
+            180. + ai
+        } else if (le > 0.) && (b > 0.) {
+            180. - ai
+        } else {
+            ai
+        }
+    };
+
+    (theta, phi_z)
+}
+
 #[interrupt]
 fn TIMER_IRQ_0() {
     // Enter critical section
@@ -327,7 +441,7 @@ fn TIMER_IRQ_0() {
 fn UART1_IRQ() {
     // Enter critical section
     cortex_m::interrupt::free(|cs| {
-    // peripheral handles
+        // peripheral handles
         let mut uart = UARTCMD.borrow(cs).borrow_mut();
         let mut dir = DIRECTION.borrow(cs).borrow_mut();
 
@@ -396,11 +510,11 @@ fn UART0_IRQ() {
                         gga_confirmed.set(true);// set flag
                     } else {
                         started.set(false);// unset flag; start again
-                        buffer.as_mut().unwrap().clear();// clear buffer
                     }
                 }
             }
         } else {
+            buffer.as_mut().unwrap().clear();// clear buffer
             gga_acquired.set(false);// service flag incase not read; to avoid reading empty buffer
             let b = receive_uart_data(uart.as_mut().unwrap());// Received data
             if b == b'$'{//start of nmea sentence
@@ -417,4 +531,20 @@ enum Direction {
     Up,
     Down,
     Zero,
+}
+
+struct Position {
+    lat: f32,
+    long: f32,
+    alt: f32,
+}
+
+impl Position {
+    fn new() -> Self {
+        Position {
+            lat: 0.,
+            long: 0.,
+            alt: 0.,
+        }
+    }
 }
