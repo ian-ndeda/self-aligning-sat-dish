@@ -9,7 +9,7 @@ use core::{
     fmt::Write,
 };
 use cortex_m::interrupt::Mutex;
-use rp2040_pac::{interrupt, UART1};
+use rp2040_pac::{interrupt, UART0, UART1};
 
 use heapless::String;
 
@@ -18,19 +18,23 @@ use heapless::String;
 pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 use rp2040_pac::{self as pac, Interrupt, SIO, TIMER};
-use cortex_m::peripheral::NVIC;
 
 // Global variable for peripherals
 static TIMER: Mutex<RefCell<Option<TIMER>>> = Mutex::new(RefCell::new(None));
 static SIO: Mutex<RefCell<Option<SIO>>> = Mutex::new(RefCell::new(None));
 static UARTCMD: Mutex<RefCell<Option<UART1>>> = Mutex::new(RefCell::new(None));
+static UARTDATA: Mutex<RefCell<Option<UART0>>> = Mutex::new(RefCell::new(None));
 
 // Data
 static DIRECTION: Mutex<RefCell<Option<Direction>>> = Mutex::new(RefCell::new(None));
+static BUFFER: Mutex<RefCell<Option<String<164>>>> = Mutex::new(RefCell::new(None));// buffer to hold received gps data
 
 // Flags
 static AUTO: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 static AUTO_FIRST_ITER: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+static STARTED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+static GGA_CONFIRMED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+static GGA_ACQUIRED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
 #[entry]
 fn main() -> ! {
@@ -99,9 +103,24 @@ fn main() -> ! {
                         );
     uart_cmd.uartimsc().modify(|_, w| w
                 .rtim().set_bit());// set interrupt for when there's one byte in uart rx fifo
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(interrupt::UART1_IRQ);// Unmask interrupt
-    }
+
+    // Configuring UART0; GPS data reception
+    let uart_data = dp.UART0;
+    resets.reset().modify(|_, w| w.uart0().clear_bit());// Deassert uart_data
+    // Set baudrate at 96 00
+    uart_data.uartibrd().write(|w| unsafe { w.bits(813)});
+    uart_data.uartfbrd().write(|w| unsafe { w.bits(51)});
+    uart_data.uartlcr_h().modify(|_, w| unsafe { w
+    .fen().set_bit()// Enable FIFO
+            .wlen().bits(0b11)// Set word length as 8
+    });
+    uart_data.uartcr().modify(|_, w| w
+                        .uarten().set_bit()// Enable uart_data
+                        .txe().set_bit()// Enable tx
+                        .rxe().set_bit()// Enable rx
+                        );
+    uart_data.uartimsc().modify(|_, w| w
+                               .rxim().set_bit());// set interrupt for when there data in rx fifo
 
     // Watchdog: to provide the clk_tick required by the timer
     let watchdog = dp.WATCHDOG;
@@ -114,9 +133,6 @@ fn main() -> ! {
     let timer = dp.TIMER;
     resets.reset().modify(|_, w| w.timer().clear_bit());// Deassert timer
     timer.inte().modify(|_, w| w.alarm_0().set_bit());// set alarm0 interrupt
-    unsafe {
-        NVIC::unmask(Interrupt::TIMER_IRQ_0);// Unmask interrupt
-    }
     timer.alarm0().modify(|_, w| unsafe{ w.bits(timer.timerawl().read().bits() + 1_000_000) });// set 1 sec after now alarm
 
     // Set up GPIO pins
@@ -140,7 +156,6 @@ fn main() -> ! {
     sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 25)});// Output enable for pin 25
 
     // Configure gp8 as UART1 Tx Pin
-    // Will be connected to HC-05 Rx Pin
     pads_bank0.gpio(8).modify(|_, w| w
                                .pue().set_bit()
                                .pde().set_bit()
@@ -161,19 +176,55 @@ fn main() -> ! {
 
     io_bank0.gpio(9).gpio_ctrl().modify(|_, w| w.funcsel().uart());
 
+    // Configure gp0 as UART0 Tx Pin
+    // Connected to HC-05 Rx Pin
+    pads_bank0.gpio(0).modify(|_, w| w
+                               .pue().set_bit()
+                               .pde().set_bit()
+                               .od().clear_bit()
+                               .ie().set_bit()
+                               );
+
+    io_bank0.gpio(0).gpio_ctrl().modify(|_, w| w.funcsel().uart());
+
+    // Configure gp1 as UART0 Rx Pin
+    // Will be connected to GPS Module Tx Pin
+    pads_bank0.gpio(1).modify(|_, w| w
+                               .pue().set_bit()
+                               .pde().set_bit()
+                               .od().clear_bit()
+                               .ie().set_bit()
+                               );
+
+    io_bank0.gpio(1).gpio_ctrl().modify(|_, w| w.funcsel().uart());
+
+
     // Buffers
+    let gpsbuf = String::new();// buffer to hold gps data
     let serialbuf = &mut String::<164>::new();// buffer to hold data to be serially transmitted
 
     // Tests
     writeln!(serialbuf, "\nUart command test.").unwrap();
     transmit_uart_cmd(&uart_cmd, serialbuf);
 
+    writeln!(serialbuf, "\nUart data test.\n").unwrap();
+    transmit_uart_data(&uart_data, serialbuf);
+
     // Move peripherals into global scope
     cortex_m::interrupt::free(|cs| {
         SIO.borrow(cs).replace(Some(sio));
         TIMER.borrow(cs).replace(Some(timer));
+        BUFFER.borrow(cs).replace(Some(gpsbuf));
         UARTCMD.borrow(cs).replace(Some(uart_cmd));
+        UARTDATA.borrow(cs).replace(Some(uart_data));
     });
+
+    // Unmask interrupts
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(Interrupt::TIMER_IRQ_0);
+        cortex_m::peripheral::NVIC::unmask(interrupt::UART0_IRQ);
+        cortex_m::peripheral::NVIC::unmask(interrupt::UART1_IRQ);
+    }
 
     loop {
         cortex_m::interrupt::free(|cs| {
@@ -238,6 +289,21 @@ fn transmit_uart_cmd(uart: &UART1, buffer: &mut String<164>) {
     buffer.clear()
 }
 
+fn receive_uart_data(uart: &UART0) -> u8 {// receive 1 byte
+    while uart.uartfr().read().rxfe().bit_is_set() {} // wait until byte received  
+
+    uart.uartdr().read().data().bits()// Received data
+}
+
+fn transmit_uart_data(uart: &UART0, buffer: &mut String<164>) {
+    for ch in buffer.chars() {
+        uart.uartdr().modify(|_, w| unsafe { w.data().bits(ch as u8)});// Send data
+        while uart.uartfr().read().txfe().bit_is_clear()  {}// Wait until tx finished
+    }
+
+    buffer.clear()
+}
+
 #[interrupt]
 fn TIMER_IRQ_0() {
     // Enter critical section
@@ -292,6 +358,54 @@ fn UART1_IRQ() {
                 } else if b == b'F' {
                     *dir = Some(Direction::Zero);
                 }
+            }
+        }
+    });
+}
+
+#[interrupt]
+fn UART0_IRQ() {
+    // Enter critical section
+    cortex_m::interrupt::free(|cs| {
+        // Peripherals
+        let mut uart = UARTDATA.borrow(cs).borrow_mut();
+        // Flags
+        let started = STARTED.borrow(cs);
+        let gga_confirmed = GGA_CONFIRMED.borrow(cs);
+        let gga_acquired = GGA_ACQUIRED.borrow(cs);
+
+        let mut buffer = BUFFER.borrow(cs).borrow_mut();
+
+        uart.as_mut().unwrap().uarticr().modify(|_, w| w.rxic().bit(true));// clear rx interrupt
+
+        // Data acquisition
+        if started.get() {// If nmea sentence acquisition started
+            if gga_confirmed.get() {
+                let b = receive_uart_data(uart.as_mut().unwrap());// Received data
+                buffer.as_mut().unwrap().push(char::from(b)).unwrap();// push to buffer
+                if b == b'\n' {// End of nmea sentence
+                    gga_acquired.set(true);// set flag
+                    gga_confirmed.set(false);// unset confirmed flag
+                    started.set(false);// unset flag; start again
+                }
+            } else {
+                let b = receive_uart_data(uart.as_mut().unwrap());// Received data
+                buffer.as_mut().unwrap().push(char::from(b)).unwrap();// push to buffer
+                if buffer.as_mut().unwrap().len() == 6 {// at len of 6 check if gga
+                    if buffer.as_mut().unwrap() == "$GPGGA" {// check if gga
+                        gga_confirmed.set(true);// set flag
+                    } else {
+                        started.set(false);// unset flag; start again
+                        buffer.as_mut().unwrap().clear();// clear buffer
+                    }
+                }
+            }
+        } else {
+            gga_acquired.set(false);// service flag incase not read; to avoid reading empty buffer
+            let b = receive_uart_data(uart.as_mut().unwrap());// Received data
+            if b == b'$'{//start of nmea sentence
+                buffer.as_mut().unwrap().push(char::from(b)).unwrap();// push to buffer
+                started.set(true);
             }
         }
     });
