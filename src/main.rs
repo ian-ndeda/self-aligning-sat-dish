@@ -176,6 +176,49 @@ fn main() -> ! {
     });
 
     loop {
+        cortex_m::interrupt::free(|cs| {
+            let mut direction = DIRECTION.borrow(cs).borrow_mut();
+            let mut uart_cmd = UARTCMD.borrow(cs).borrow_mut();
+
+            if AUTO.borrow(cs).get() {
+                // Auto mode
+                writeln!(serialbuf, "auto mode").unwrap();
+                transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+            } else {
+                // Manual mode
+                writeln!(serialbuf, "manual mode").unwrap();
+                transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                match direction.as_mut() {
+                    Some(Direction::Cw) => {
+                        *direction = None;// reset direction
+                        writeln!(serialbuf, "manual mode: cw").unwrap();
+                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                    },
+                    Some(Direction::Ccw) => {
+                        *direction = None;
+                        writeln!(serialbuf, "manual mode: ccw").unwrap();
+                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                    },
+                    Some(Direction::Up) => {
+                        *direction = None;
+                        writeln!(serialbuf, "manual mode: up").unwrap();
+                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                    },
+                    Some(Direction::Down) => {
+                        *direction = None;
+                        writeln!(serialbuf, "manual mode: down").unwrap();
+                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                    },
+                    Some(Direction::Zero) => {
+                        *direction = None;
+                        writeln!(serialbuf, "manual mode: position zero").unwrap();
+                        transmit_uart_cmd(uart_cmd.as_mut().unwrap(), serialbuf);
+                    },
+                    None => {},
+                }
+            }
+        });
+
         cortex_m::asm::wfi();// wait for interrupt
     }
 }
