@@ -4,9 +4,14 @@
 use panic_halt as _;
 
 use cortex_m_rt::entry;
-use core::cell::RefCell;
+use core::{
+    cell::{Cell, RefCell},
+    fmt::Write,
+};
 use cortex_m::interrupt::Mutex;
-use rp2040_pac::interrupt;
+use rp2040_pac::{interrupt, UART1};
+
+use heapless::String;
 
 #[link_section = ".boot2"]
 #[used]
@@ -18,6 +23,14 @@ use cortex_m::peripheral::NVIC;
 // Global variable for peripherals
 static TIMER: Mutex<RefCell<Option<TIMER>>> = Mutex::new(RefCell::new(None));
 static SIO: Mutex<RefCell<Option<SIO>>> = Mutex::new(RefCell::new(None));
+static UARTCMD: Mutex<RefCell<Option<UART1>>> = Mutex::new(RefCell::new(None));
+
+// Data
+static DIRECTION: Mutex<RefCell<Option<Direction>>> = Mutex::new(RefCell::new(None));
+
+// Flags
+static AUTO: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+static AUTO_FIRST_ITER: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
 #[entry]
 fn main() -> ! {
@@ -70,6 +83,26 @@ fn main() -> ! {
                                 .enable().set_bit()
                                 );
 
+    // Configuring UART1; command reception
+    let uart_cmd = dp.UART1;
+    resets.reset().modify(|_, w| w.uart1().clear_bit());// Deassert uart_cmd
+    // Set baudrate at 96 00
+    uart_cmd.uartibrd().write(|w| unsafe { w.bits(813)});
+    uart_cmd.uartfbrd().write(|w| unsafe { w.bits(51)});
+    uart_cmd.uartlcr_h().modify(|_, w| unsafe { w
+            .wlen().bits(0b11)// Set word length as 8
+    });
+    uart_cmd.uartcr().modify(|_, w| w
+                        .uarten().set_bit()// Enable uart_cmd
+                        .txe().set_bit()// Enable tx
+                        .rxe().set_bit()// Enable rx
+                        );
+    uart_cmd.uartimsc().modify(|_, w| w
+                .rtim().set_bit());// set interrupt for when there's one byte in uart rx fifo
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(interrupt::UART1_IRQ);// Unmask interrupt
+    }
+
     // Watchdog: to provide the clk_tick required by the timer
     let watchdog = dp.WATCHDOG;
     watchdog.tick().modify(|_, w| unsafe{ w
@@ -106,15 +139,60 @@ fn main() -> ! {
     io_bank0.gpio(25).gpio_ctrl().modify(|_, w| w.funcsel().sio());// set function as sio 
     sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 25)});// Output enable for pin 25
 
+    // Configure gp8 as UART1 Tx Pin
+    // Will be connected to HC-05 Rx Pin
+    pads_bank0.gpio(8).modify(|_, w| w
+                               .pue().set_bit()
+                               .pde().set_bit()
+                               .od().clear_bit()
+                               .ie().set_bit()
+                               );
+
+    io_bank0.gpio(8).gpio_ctrl().modify(|_, w| w.funcsel().uart());
+
+    // Configure gp9 as UART1 Rx Pin
+    // Will be connected to HC-05 Tx Pin
+    pads_bank0.gpio(9).modify(|_, w| w
+                               .pue().set_bit()
+                               .pde().set_bit()
+                               .od().clear_bit()
+                               .ie().set_bit()
+                               );
+
+    io_bank0.gpio(9).gpio_ctrl().modify(|_, w| w.funcsel().uart());
+
+    // Buffers
+    let serialbuf = &mut String::<164>::new();// buffer to hold data to be serially transmitted
+
+    // Tests
+    writeln!(serialbuf, "\nUart command test.").unwrap();
+    transmit_uart_cmd(&uart_cmd, serialbuf);
+
     // Move peripherals into global scope
     cortex_m::interrupt::free(|cs| {
         SIO.borrow(cs).replace(Some(sio));
         TIMER.borrow(cs).replace(Some(timer));
+        UARTCMD.borrow(cs).replace(Some(uart_cmd));
     });
 
     loop {
         cortex_m::asm::wfi();// wait for interrupt
     }
+}
+
+fn receive_uart_cmd(uart: &UART1) -> u8 {// receive 1 byte
+    while uart.uartfr().read().rxfe().bit_is_set() {} // wait until byte received
+
+    uart.uartdr().read().data().bits()// Received data
+}
+
+fn transmit_uart_cmd(uart: &UART1, buffer: &mut String<164>) {
+    for ch in buffer.chars() {
+        uart.uartdr().modify(|_, w| unsafe { w.data().bits(ch as u8)});// Send data
+        while uart.uartfr().read().busy().bit_is_set()  {}// Wait until tx finished
+    }
+
+    buffer.clear()
 }
 
 #[interrupt]
@@ -134,4 +212,52 @@ fn TIMER_IRQ_0() {
         timer.as_mut().unwrap().alarm0().write(|w|  unsafe { w
             .bits(timer_alarm0) });// set sec's after now alarm
     });
+}
+
+#[interrupt]
+fn UART1_IRQ() {
+    // Enter critical section
+    cortex_m::interrupt::free(|cs| {
+    // peripheral handles
+        let mut uart = UARTCMD.borrow(cs).borrow_mut();
+        let mut dir = DIRECTION.borrow(cs).borrow_mut();
+
+        uart.as_mut().unwrap().uarticr().modify(|_, w| w.rtic().bit(true));// clear rx interrupt 
+
+        // receive commands
+        let b = receive_uart_cmd(uart.as_mut().unwrap() );// Received byte
+
+        if b == b'A' { // toggle between auto and manual modes
+            if AUTO.borrow(cs).get() {
+                AUTO.borrow(cs).set(false);
+            } else {
+                AUTO.borrow(cs).set(true);
+                // if toggling to auto; set first iter true
+                AUTO_FIRST_ITER.borrow(cs).set(true);
+            }
+        } else {
+            // update direction cmd only in manual mode
+            if !AUTO.borrow(cs).get() {
+                if b == b'B' {
+                    *dir = Some(Direction::Cw);
+                } else if b == b'C' {
+                    *dir = Some(Direction::Ccw);
+                } else if b == b'D' {
+                    *dir = Some(Direction::Up);
+                } else if b == b'E' {
+                    *dir = Some(Direction::Down);
+                } else if b == b'F' {
+                    *dir = Some(Direction::Zero);
+                }
+            }
+        }
+    });
+}
+
+enum Direction {
+    Cw,
+    Ccw,
+    Up,
+    Down,
+    Zero,
 }
