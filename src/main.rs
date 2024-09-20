@@ -10,7 +10,6 @@ use core::{
     fmt::Write,
 };
 use cortex_m::interrupt::Mutex;
-use rp2040_pac::{interrupt, UART0, UART1};
 
 use heapless::{Vec, String};
 use micromath::F32Ext;
@@ -19,7 +18,36 @@ use micromath::F32Ext;
 #[used]
 pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
-use rp2040_pac::{self as pac, Interrupt, SIO, TIMER};
+use rp2040_pac::{
+    self as pac,
+    Interrupt, interrupt,
+    UART0, UART1, I2C0, SIO, TIMER
+};
+
+// Global constants
+const TX_FIFO_SIZE: u8 = 16;// I2C FIFO size
+
+// Slave Address
+const HMC5883L_ADDR: u16 = 30;
+
+// Mode Register.
+const MODE_R: u8 = 0x02; // HMC5883L
+
+// Configuration Register A
+const CFG_REG_A: u8 = 0x0;// HMC5883L
+
+// Configuration Register B
+const CFG_REG_B: u8 = 0x01;// HMC5883L
+
+// Data Registers.
+const DATA_OUTPUT_X_MSB_R: u8 = 0x03;// HMC5883L
+
+// ID
+const IDENTIFICATION_REG_A: u8 = 0xA;// HMC5883L
+const IDENTIFICATION_REG_B: u8 = 0xB;// HMC5883L
+const IDENTIFICATION_REG_C: u8 = 0xC;// HMC5883L
+
+const MAGNETIC_DECLINATION: f32 = 1.667;
 
 // Global variable for peripherals
 static TIMER: Mutex<RefCell<Option<TIMER>>> = Mutex::new(RefCell::new(None));
@@ -137,6 +165,34 @@ fn main() -> ! {
     timer.inte().modify(|_, w| w.alarm_0().set_bit());// set alarm0 interrupt
     timer.alarm0().modify(|_, w| unsafe{ w.bits(timer.timerawl().read().bits() + 1_000_000) });// set 1 sec after now alarm
 
+    // Set up I2C
+    let mut i2c0 = dp.I2C0;
+    resets.reset().modify(|_,w| w.i2c0().clear_bit());
+
+    i2c0.ic_enable().modify(|_, w| w.enable().clear_bit());// disable i2c
+    // select controller mode & speed
+    i2c0.ic_con().modify(|_, w| {
+        w.speed().fast();
+        w.master_mode().enabled();
+        w.ic_slave_disable().slave_disabled();
+        w.ic_restart_en().enabled();
+        w.tx_empty_ctrl().enabled()
+    });
+    // Clear FIFO threshold
+    i2c0.ic_tx_tl().write(|w| unsafe { w.tx_tl().bits(0) });
+    i2c0.ic_rx_tl().write(|w| unsafe { w.rx_tl().bits(0) });
+                
+    // IC_xCNT = (ROUNDUP(MIN_SCL_HIGH_LOWtime*OSCFREQ,0))
+    // IC_HCNT = (600ns * 125MHz) + 1
+    // IC_LCNT = (1300ns * 125MHz) + 1
+    i2c0.ic_fs_scl_hcnt().write(|w| unsafe { w.ic_fs_scl_hcnt().bits(76) });
+    i2c0.ic_fs_scl_lcnt().write(|w| unsafe { w.ic_fs_scl_lcnt().bits(163) });
+    // spkln = lcnt/16;
+    i2c0.ic_fs_spklen().write(|w| unsafe {  w.ic_fs_spklen().bits(163/16) });
+    // sda_tx_hold_count = freq_in [cycles/s] * 300ns for scl < 1MHz
+    let sda_tx_hold_count = ((125_000_000 * 3) / 10000000) + 1;
+    i2c0.ic_sda_hold().modify(|_r, w| unsafe { w.ic_sda_tx_hold().bits(sda_tx_hold_count as u16) });
+
     // Set up GPIO pins
     let sio = dp.SIO;
     let io_bank0 = dp.IO_BANK0;
@@ -200,9 +256,29 @@ fn main() -> ! {
 
     io_bank0.gpio(1).gpio_ctrl().modify(|_, w| w.funcsel().uart());
 
+    // Configure gp4 as I2C0 SDA pin
+    pads_bank0.gpio(4).modify(|_, w| w
+                               .pue().set_bit() //pull up enable
+                               .od().clear_bit() //output disable
+                               .ie().set_bit() //input enable
+                               );
+
+    io_bank0.gpio(4).gpio_ctrl().modify(|_, w| w.funcsel().i2c()); 
+
+    // Configure gp5 as I2C0 SCL pin
+    pads_bank0.gpio(5).modify(|_, w| w
+                               .pue().set_bit() //pull up enable
+                               .od().clear_bit() //output disable
+                               .ie().set_bit() //input enable
+                               );
+
+    io_bank0.gpio(5).gpio_ctrl().modify(|_, w| w.funcsel().i2c());
+
     // Buffers
     let gpsbuf = String::new();// buffer to hold gps data
     let serialbuf = &mut String::<164>::new();// buffer to hold data to be serially transmitted
+
+    configure_compass(&mut i2c0, &uart_data);
 
     // Variables
     let (mut theta, mut phi) = (0., 0.);
@@ -266,6 +342,13 @@ fn main() -> ! {
                         position.alt);
 
                     writeln!(serialbuf, "theta: {}  phi: {}", theta, phi).unwrap();
+                    transmit_uart_data(
+                        uart_data.as_mut().unwrap(),
+                        serialbuf);
+
+                    // Get magnetic heading
+                    let heading = get_magnetic_heading(&mut i2c0);
+                    writeln!(serialbuf, "heading: {}", heading.round()).unwrap();
                     transmit_uart_data(
                         uart_data.as_mut().unwrap(),
                         serialbuf);
@@ -416,6 +499,260 @@ fn get_look_angles(lat: f32, long: f32, alt: f32) -> (f32, f32) {
     };
 
     (theta, phi_z)
+}
+
+fn i2c_read(
+    i2c0: &mut I2C0,
+    addr: u16,
+    bytes: &mut [u8],
+) -> Result<(), u32> {
+    i2c0.ic_enable().modify(|_, w| w.enable().clear_bit());// disable i2c
+    i2c0.ic_tar().modify(|_, w| unsafe { w.ic_tar().bits(addr) });// slave address
+    i2c0.ic_enable().modify(|_, w| w.enable().set_bit());// enable i2c
+
+    let last_index = bytes.len() - 1;
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let first = i == 0;
+        let last = i == last_index;
+
+        // wait until there is space in the FIFO to write the next byte
+        while TX_FIFO_SIZE - i2c0.ic_txflr().read().txflr().bits() == 0 {}
+
+        i2c0.ic_data_cmd().modify(|_, w| {
+            if first {
+                w.restart().enable();
+            } else {
+                w.restart().disable();
+            }
+
+            if last {
+                w.stop().enable();
+            } else {
+                w.stop().disable();
+            }
+
+            w.cmd().read()
+        }); 
+
+        //Wait until address tx'ed
+        while i2c0.ic_raw_intr_stat().read().tx_empty().is_inactive() {}
+        //Clear ABORT interrupt
+        //self.i2c0.ic_clr_tx_abrt.read();
+
+        while i2c0.ic_rxflr().read().bits() == 0 {
+            //Wait while receive FIFO empty
+            //If attempt aborts : not valid address; return error with
+            //abort reason.
+            let abort_reason = i2c0.ic_tx_abrt_source().read().bits();
+            //Clear ABORT interrupt
+            i2c0.ic_clr_tx_abrt().read();
+            if abort_reason != 0 {
+                return Err(abort_reason)
+            } 
+        }
+
+        *byte = i2c0.ic_data_cmd().read().dat().bits();
+    }
+
+    Ok(())
+}
+
+fn i2c_write(
+    i2c0: &mut I2C0,
+    addr: u16,
+    bytes: &[u8],
+) -> Result<(), u32> {
+    i2c0.ic_enable().modify(|_, w| w.enable().clear_bit());// disable i2c
+    i2c0.ic_tar().modify(|_, w| unsafe { w.ic_tar().bits(addr) });// slave address
+    i2c0.ic_enable().modify(|_, w| w.enable().set_bit());// enable i2c
+
+    let last_index = bytes.len() - 1;
+    for (i, byte) in bytes.iter().enumerate() {
+        let last = i == last_index;
+
+        i2c0.ic_data_cmd().modify(|_, w| {
+            if last {
+                w.stop().enable();
+            } else {
+                w.stop().disable();
+            }
+            unsafe { w.dat().bits(*byte)}
+        }); 
+
+        // Wait until address and data tx'ed
+        while i2c0.ic_raw_intr_stat().read().tx_empty().is_inactive() {}
+        // Clear ABORT interrupt
+        // self.i2c0.ic_clr_tx_abrt.read();
+
+        // If attempt aborts : not valid address; return error with
+        // abort reason.
+        let abort_reason = i2c0.ic_tx_abrt_source().read().bits();
+        // Clear ABORT interrupt
+        i2c0.ic_clr_tx_abrt().read();
+        if abort_reason != 0 {
+            // Wait until the STOP condition has occured
+            while i2c0.ic_raw_intr_stat().read().stop_det().is_inactive() {}
+            // Clear STOP interrupt
+            i2c0.ic_clr_stop_det().read().clr_stop_det();
+            return Err(abort_reason)
+        } 
+
+        if last {
+            // Wait until the STOP condition has occured
+            while i2c0.ic_raw_intr_stat().read().stop_det().is_inactive() {}
+            // Clear STOP interrupt
+            i2c0.ic_clr_stop_det().read().clr_stop_det();
+        }
+    }
+
+    Ok(())
+}
+
+fn configure_compass(i2c0: &mut I2C0, uart: &UART0) { // Configure and confirm HMC5833L
+    let mut writebuf: [u8; 1];// buffer to hold 1 byte
+    let mut writebuf2: [u8; 2];// buffer to hold 2 bytes
+    let mut readbuf: [u8; 1] = [0; 1];
+    let serialbuf = &mut String::<164>::new();
+
+    writeln!(serialbuf, "Compass configuration.").unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    // ID the compass
+    // Read ID REG A
+    writebuf = [IDENTIFICATION_REG_A];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+    i2c_read(i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
+    let id_a = readbuf[0];
+    writeln!(serialbuf, "Id reg a: 0x{:02X}", id_a).unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    // Read ID REG B 
+    writebuf = [IDENTIFICATION_REG_B];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+    i2c_read(i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
+    let id_b = readbuf[0];
+    writeln!(serialbuf, "Id reg b: 0x{:02X}", id_b).unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    // Read ID REG C
+    writebuf = [IDENTIFICATION_REG_C];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+    i2c_read(i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
+    let id_c = readbuf[0];
+    writeln!(serialbuf, "Id reg c: 0x{:02X}", id_c).unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    if id_a == 0x48 && id_b == 0x34 && id_c == 0x33 {
+        writeln!(serialbuf, "Magnetometer ID confirmed!").unwrap();
+        transmit_uart_data(uart, serialbuf);
+    }
+
+    // Set compass in continuous mode & confirm
+    writebuf2 = [MODE_R, 0x0];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf2).unwrap();
+
+    writebuf = [MODE_R];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+    i2c_read(i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
+        
+    let mode = readbuf[0];
+    writeln!(serialbuf, "Mode reg: 0b{:08b}", mode).unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    //let mode = readbuf[0];
+    if (mode & 1 << 1) == 0 && (mode & 1 << 0) == 0  { 
+        writeln!(serialbuf, "continuous mode set.").unwrap();
+        transmit_uart_data(uart, serialbuf);
+    } else if (mode & 1 << 1) == 0 && (mode & 1 << 0) != 0 {
+        writeln!(serialbuf, "single-measurement mode set.").unwrap();
+        transmit_uart_data(uart, serialbuf);
+    } else {
+        writeln!(serialbuf, "device in idle mode.").unwrap();
+        transmit_uart_data(uart, serialbuf);
+    }
+
+    // Set data output rate & number of samples & confirm
+    // sample avg = 8; data output rate = 15Hz; normal measurement cfgn
+    writebuf2 = [CFG_REG_A, 0b01110000];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf2).unwrap();
+    writebuf = [CFG_REG_A];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+    i2c_read(i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
+
+    let cfg_a = readbuf[0];
+    writeln!(serialbuf, "cfg reg a: 0b{:08b}", cfg_a).unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    // Set Gain & confirm
+    // gain = 1090 LSB/Gauss
+    writebuf2 = [CFG_REG_B, 0b00100000];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf2).unwrap();
+
+    writebuf = [CFG_REG_B];
+    i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+    i2c_read(i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
+
+    let cfg_b = readbuf[0];
+    writeln!(serialbuf, "cfg reg b: 0b{:08b}", cfg_b).unwrap();
+    transmit_uart_data(uart, serialbuf);
+
+    if (cfg_a == 0b01110000) && (cfg_b == 0b00100000)   { 
+        writeln!(serialbuf, "cfg regs set.").unwrap();
+        transmit_uart_data(uart, serialbuf);
+    }
+}
+
+fn get_magnetic_heading(i2c0: &mut I2C0) -> f32 { 
+    // Read raw data from compass.
+    // Capture 50 heading samples and return the average
+    let mut count = 0.;
+    let samples = 50.;
+    let mut headings = 0.;
+    
+    while count != samples {
+        // Point to the address of DATA_OUTPUT_X_MSB_R
+        let writebuf = [DATA_OUTPUT_X_MSB_R];
+        i2c_write(i2c0, HMC5883L_ADDR, &writebuf).unwrap();
+        // Read the output of the HMC5883L
+        // All six registers are read into the
+        // rawbuf buffer
+        let mut rawbuf: [u8; 6] = [0; 6];
+        i2c_read(i2c0, HMC5883L_ADDR, &mut rawbuf).unwrap();
+
+        let x_h = rawbuf[0] as u16;
+        let x_l = rawbuf[1] as u16;
+        let z_h = rawbuf[2] as u16;
+        let z_l = rawbuf[3] as u16;
+        let y_h = rawbuf[4] as u16;
+        let y_l = rawbuf[5] as u16;
+
+        let x = ((x_h << 8) + x_l) as i16;
+        let y = ((y_h << 8) + y_l) as i16;
+        let _z = ((z_h << 8) + z_l) as i16;
+
+        // North-Clockwise convention for getting the heading
+        let mut heading = (y as f32 + 185.).atan2(x as f32 + 75.);
+
+        heading += MAGNETIC_DECLINATION*(PI/180.);// add declination in radians
+
+        // Check for sign
+        if heading < 0. {
+            heading += 2.*PI;
+        }
+        
+        // Check for value wrap
+        if heading > 2.*PI {
+            heading -= 2.*PI;
+        }
+
+        heading *= 180./PI;
+
+        headings += heading;
+        
+        count += 1.;
+    }
+
+    headings/samples
 }
 
 #[interrupt]
