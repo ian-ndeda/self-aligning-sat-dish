@@ -490,7 +490,7 @@ fn UART0_IRQ() {
 
         let mut buffer = BUFFER.borrow(cs).borrow_mut();
 
-        uart.as_mut().unwrap().uarticr().modify(|_, w| w.rxic().bit(true));// clear rx interrupt
+        uart.as_mut().unwrap().uarticr().modify(|_, w| w.rtic().bit(true));// clear rx interrupt
 
         // Data acquisition
         if started.get() {// If nmea sentence acquisition started
