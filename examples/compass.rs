@@ -296,7 +296,7 @@ fn main() -> ! {
     // ID the compass
     // Read ID REG A
     writebuf = [IDENTIFICATION_REG_A];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
     i2c_read(&mut i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
     let id_a = readbuf[0];
     writeln!(serialbuf, "Id reg a: 0x{:02X}", id_a).unwrap();
@@ -304,7 +304,7 @@ fn main() -> ! {
 
     // Read ID REG B 
     writebuf = [IDENTIFICATION_REG_B];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
     i2c_read(&mut i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
     let id_b = readbuf[0];
     writeln!(serialbuf, "Id reg b: 0x{:02X}", id_b).unwrap();
@@ -312,7 +312,7 @@ fn main() -> ! {
 
     // Read ID REG C
     writebuf = [IDENTIFICATION_REG_C];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
     i2c_read(&mut i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
     let id_c = readbuf[0];
     writeln!(serialbuf, "Id reg c: 0x{:02X}", id_c).unwrap();
@@ -325,10 +325,10 @@ fn main() -> ! {
 
     // Set compass in continuous mode & confirm
     writebuf2 = [MODE_R, 0x0];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf2).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf2).unwrap();
 
     writebuf = [MODE_R];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
     i2c_read(&mut i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
         
     let mode = readbuf[0];
@@ -350,9 +350,9 @@ fn main() -> ! {
     // Set data output rate & number of samples & confirm
     // sample avg = 8; data output rate = 15Hz; normal measurement cfgn
     writebuf2 = [CFG_REG_A, 0b01110000];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf2).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf2).unwrap();
     writebuf = [CFG_REG_A];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
     i2c_read(&mut i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
 
     let cfg_a = readbuf[0];
@@ -362,10 +362,10 @@ fn main() -> ! {
     // Set Gain & confirm
     // gain = 1090 LSB/Gauss
     writebuf2 = [CFG_REG_B, 0b00100000];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf2).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf2).unwrap();
 
     writebuf = [CFG_REG_B];
-    i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+    i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
     i2c_read(&mut i2c0, HMC5883L_ADDR, &mut readbuf).unwrap();
 
     let cfg_b = readbuf[0];
@@ -404,7 +404,7 @@ fn main() -> ! {
             // Read raw data from compass.
             // Point to the address of DATA_OUTPUT_X_MSB_R
             writebuf = [DATA_OUTPUT_X_MSB_R];
-            i2c_write(&mut i2c0, HMC5883L_ADDR, &mut writebuf).unwrap();
+            i2c_write(&mut i2c0, HMC5883L_ADDR, &writebuf).unwrap();
             // Read the output of the HMC5883L
             // All six registers are read into the
             // rawbuf buffer
