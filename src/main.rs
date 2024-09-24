@@ -9,7 +9,11 @@ use core::{
     cell::{Cell, RefCell},
     fmt::Write,
 };
-use cortex_m::interrupt::Mutex;
+
+use cortex_m::{
+    delay::Delay,
+    interrupt::Mutex
+};
 
 use heapless::{Vec, String};
 use micromath::F32Ext;
@@ -20,6 +24,7 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 use rp2040_pac::{
     self as pac,
+    pwm::ch::CH,
     Interrupt, interrupt,
     UART0, UART1, I2C0, SIO, TIMER
 };
@@ -69,7 +74,7 @@ static GGA_ACQUIRED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 #[entry]
 fn main() -> ! {
     let dp = unsafe { pac::Peripherals::steal() };// Take the device peripherals
-    let _cp = pac::CorePeripherals::take().unwrap();// Take the core peripherals
+    let cp = pac::CorePeripherals::take().unwrap();// Take the core peripherals
 
     // Configure the External Oscillator
     let xosc = dp.XOSC;
@@ -193,6 +198,20 @@ fn main() -> ! {
     let sda_tx_hold_count = ((125_000_000 * 3) / 10000000) + 1;
     i2c0.ic_sda_hold().modify(|_r, w| unsafe { w.ic_sda_tx_hold().bits(sda_tx_hold_count as u16) });
 
+    // pwm2 set up
+    let pwm2 = dp.PWM.ch(2);// Acquire handle for pwm slice 2
+    resets.reset().modify(|_, w| w.pwm().clear_bit());// Deassert pwm
+
+    // Configuring pwm2
+    pwm2.csr().modify(|_, w| w
+                            .divmode().div()// free runnning counter determined by fractional divider
+                            .ph_correct().set_bit()// enable phase correction 
+                            );
+    pwm2.top().modify(|_, w| unsafe { w.bits(49_999) });// sets the wrap value: TOP + 1
+    // For a fpwm of 50Hz w/ top of 50000 div need to be 25
+    pwm2.div().modify(|_, w| unsafe { w.int().bits(25).frac().bits(0) });
+    pwm2.csr().modify(|_, w| w.en().set_bit());// Enable pwm2
+
     // Set up GPIO pins
     let sio = dp.SIO;
     let io_bank0 = dp.IO_BANK0;
@@ -274,6 +293,19 @@ fn main() -> ! {
 
     io_bank0.gpio(5).gpio_ctrl().modify(|_, w| w.funcsel().i2c());
 
+    // Configure GP20 as PWM channel 1A
+    pads_bank0.gpio(20).modify(|_, w| w
+                                .pue().set_bit()// pull up enable
+                                .pde().set_bit()// pull down enable
+                                .od().clear_bit()// output disable
+                                .ie().set_bit()// input enable
+                                );
+
+    io_bank0.gpio(20).gpio_ctrl().modify(|_, w| w.funcsel().pwm());// connect to matching pwm
+
+    // Delay handle
+    let mut delay = Delay::new(cp.SYST, 125_000_000);
+
     // Buffers
     let gpsbuf = String::new();// buffer to hold gps data
     let serialbuf = &mut String::<164>::new();// buffer to hold data to be serially transmitted
@@ -291,6 +323,9 @@ fn main() -> ! {
     transmit_uart_data(&uart_data, serialbuf);
 
     let mut position = Position::new();// gps position struct
+    let mut tilt_angle = 90.; // initialize tilt angle i.e. kit facing up
+
+    position_kit_tilt(pwm2, &mut tilt_angle);// start position of tilt
 
     // Move peripherals into global scope
     cortex_m::interrupt::free(|cs| {
@@ -370,10 +405,20 @@ fn main() -> ! {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: up").unwrap();
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
+
+                        tilt(pwm2, &mut delay, &mut tilt_angle, Direction::Up);
+
+                        writeln!(serialbuf, "tilt angle: {}", tilt_angle.round()).unwrap();
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     Some(Direction::Down) => {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: down").unwrap();
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
+
+                        tilt(pwm2, &mut delay, &mut tilt_angle, Direction::Down);
+
+                        writeln!(serialbuf, "tilt angle: {}", tilt_angle.round()).unwrap();
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     Some(Direction::Zero) => {
@@ -387,6 +432,44 @@ fn main() -> ! {
         });
 
         cortex_m::asm::wfi();// wait for interrupt
+    }
+}
+
+fn tilt(pwm: &CH, delay: &mut Delay, tilt_angle: &mut f32, direction: Direction) {
+    if *tilt_angle >= 0. && *tilt_angle <= 90. { 
+        // valid movts only if angle within range
+        match direction {
+            Direction::Up => {
+                if *tilt_angle != 0. {// constrain angle within range
+                    *tilt_angle -= 1.;// update tilt angle
+                    position_kit_tilt(pwm, tilt_angle);
+                    delay.delay_ms(1);// delay
+                }
+            },
+            Direction::Down => {
+                if *tilt_angle != 90. {// constrain angle within range
+                    *tilt_angle += 1.;// update tilt angle
+                    position_kit_tilt(pwm, tilt_angle);
+                    delay.delay_ms(1);// delay
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+fn position_kit_tilt(pwm: &CH, tilt_angle: &mut f32) {
+    // facing up --> at 90 deg
+    // standing vertically --> 0 deg 
+    sweep(pwm, (90. - tilt_angle.round()) as u16);
+}
+
+pub fn sweep(pwm: &CH, mut degrees: u16) {
+    const BASE: u16 = 1500;// here pwm at position 0 degrees
+
+    degrees = BASE + (degrees * 28);// ~28: movt by 1 degree 
+    unsafe {
+        pwm.cc().modify(|_, w| w.a().bits(degrees) );// move by one degree * no of degrees
     }
 }
 
