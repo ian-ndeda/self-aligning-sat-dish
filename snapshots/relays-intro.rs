@@ -325,6 +325,8 @@ fn main() -> ! {
 
     io_bank0.gpio(17).gpio_ctrl().modify(|_, w| w.funcsel().sio());// set function as sio
 
+    sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 17)});// Output enable for pin 17
+
     // Delay handle
     let mut delay = Delay::new(cp.SYST, 125_000_000);
 
