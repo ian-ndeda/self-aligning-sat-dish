@@ -303,6 +303,52 @@ fn main() -> ! {
 
     io_bank0.gpio(20).gpio_ctrl().modify(|_, w| w.funcsel().pwm());// connect to matching pwm
 
+    // Configure GP16 for Relay 1 Enable
+    pads_bank0.gpio(16).modify(|_, w| w
+                               .pue().set_bit()// pullup enable
+                               .pde().set_bit()// pulldown enable
+                               .od().clear_bit()// output enable
+                               .ie().set_bit()// input enable
+                               );
+
+    io_bank0.gpio(16).gpio_ctrl().modify(|_, w| w.funcsel().sio());// set function as sio
+
+    sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 16)});// Output enable for pin 16
+
+    // Configure GP17 for Relay 2 Enable
+    pads_bank0.gpio(17).modify(|_, w| w
+                               .pue().set_bit()// pullup enable
+                               .pde().set_bit()// pulldown enable
+                               .od().clear_bit()// output enable
+                               .ie().set_bit()// input enable
+                               );
+
+    io_bank0.gpio(17).gpio_ctrl().modify(|_, w| w.funcsel().sio());// set function as sio
+
+    // Configure GP16 for Relay 1 Enable
+    pads_bank0.gpio(16).modify(|_, w| w
+                               .pue().set_bit()// pullup enable
+                               .pde().set_bit()// pulldown enable
+                               .od().clear_bit()// output enable
+                               .ie().set_bit()// input enable
+                               );
+
+    io_bank0.gpio(16).gpio_ctrl().modify(|_, w| w.funcsel().sio());// set function as sio
+
+    sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 16)});// Output enable for pin 16
+
+    // Configure GP17 for Relay 2 Enable
+    pads_bank0.gpio(17).modify(|_, w| w
+                               .pue().set_bit()// pullup enable
+                               .pde().set_bit()// pulldown enable
+                               .od().clear_bit()// output enable
+                               .ie().set_bit()// input enable
+                               );
+
+    io_bank0.gpio(17).gpio_ctrl().modify(|_, w| w.funcsel().sio());// set function as sio
+
+    sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 17)});// Output enable for pin 17
+
     // Delay handle
     let mut delay = Delay::new(cp.SYST, 125_000_000);
 
@@ -348,6 +394,7 @@ fn main() -> ! {
             let mut direction = DIRECTION.borrow(cs).borrow_mut();
             let mut uart_data = UARTDATA.borrow(cs).borrow_mut();
             let mut buffer = BUFFER.borrow(cs).borrow_mut();
+            let mut sio = SIO.borrow(cs).borrow_mut();
 
             if AUTO.borrow(cs).get() {
                 // Auto mode
@@ -395,11 +442,15 @@ fn main() -> ! {
                         *direction = None;// reset direction
                         writeln!(serialbuf, "manual mode: cw").unwrap();
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
+
+                        pan(&mut delay, sio.as_mut().unwrap(), Direction::Cw);
                     },
                     Some(Direction::Ccw) => {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: ccw").unwrap();
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
+
+                        pan(&mut delay, sio.as_mut().unwrap(), Direction::Ccw);
                     },
                     Some(Direction::Up) => {
                         *direction = None;
@@ -432,6 +483,32 @@ fn main() -> ! {
         });
 
         cortex_m::asm::wfi();// wait for interrupt
+    }
+}
+
+fn pan(delay: &mut Delay, sio: &mut SIO, direction: Direction) {
+    match direction {
+        Direction::Cw => {
+	    // Move servo CW: Relay 1 ON, Relay 2 OFF
+	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() | 1 << 16)});// Set pin 16 high
+
+	    delay.delay_ms(10);// delay
+
+	    // Put servo OFF
+	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 16))});// Set pin 16 low
+	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 17))});// Set pin 17 low
+        },
+        Direction::Ccw => {
+	    // Move servo CCW: Relay 2 ON, Relay 1 OFF
+	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() | 1 << 17)});// Set pin 17 high
+
+	    delay.delay_ms(10);// delay
+
+	    // Put servo OFF
+	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 16))});// Set pin 16 low
+	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 17))});// Set pin 17 low
+        },
+        _ => {},
     }
 }
 
