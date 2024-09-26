@@ -349,6 +349,10 @@ fn main() -> ! {
 
     sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 17)});// Output enable for pin 17
 
+    // Test 
+    writeln!(serialbuf, "\nSelf-Aligning Satellite Dish in Rust\n").unwrap();
+    transmit_uart_data(&uart_data, serialbuf);
+
     // Delay handle
     let mut delay = Delay::new(cp.SYST, 125_000_000);
 
@@ -359,14 +363,10 @@ fn main() -> ! {
     configure_compass(&mut i2c0, &uart_data);
 
     // Variables
-    let (mut theta, mut phi) = (0., 0.);
-
-    // Tests
-    writeln!(serialbuf, "\nUart command test.").unwrap();
-    transmit_uart_cmd(&uart_cmd, serialbuf);
-
-    writeln!(serialbuf, "\nUart data test.\n").unwrap();
-    transmit_uart_data(&uart_data, serialbuf);
+    let (mut theta, mut phi) = (0., 0.);// look angles
+    let mut adjusted_theta: f32 = 0.;// adjusted theta; new theta to track, considers tilt
+    let mut heading = 0.;// magnetic heading
+    let mut ref_theta = 0.;// reference theta; initial value to be referenced for variance
 
     let mut position = Position::new();// gps position struct
     let mut tilt_angle = 90.; // initialize tilt angle i.e. kit facing up
@@ -399,23 +399,9 @@ fn main() -> ! {
             if AUTO.borrow(cs).get() {
                 // Auto mode
                 if GGA_ACQUIRED.borrow(cs).get() {
-                    // Transmit raw data from gps
-                    write!(serialbuf, "\n{}", buffer.as_mut().unwrap()).unwrap(); 
-                    transmit_uart_data(
-                        uart_data.as_mut().unwrap(),
-                        serialbuf);
-                    GGA_ACQUIRED.borrow(cs).set(false);// clear the flag
 
-                    // update the coordinates from the nmea sentence
+                    // Update the coordinates from the nmea sentence
                     parse_gga(buffer.as_mut().unwrap(), &mut position);
-
-                    // Transmit gps position
-                    let lat = position.lat;
-                    let long = position.long;
-                    writeln!(serialbuf, "lat: {}  long: {}", lat, long).unwrap();
-                    transmit_uart_data(
-                        uart_data.as_mut().unwrap(),
-                        serialbuf);
 
                     // Calculate look angles
                     (theta, phi) = get_look_angles(
@@ -428,12 +414,100 @@ fn main() -> ! {
                         uart_data.as_mut().unwrap(),
                         serialbuf);
 
-                    // Get magnetic heading
-                    let heading = get_magnetic_heading(&mut i2c0);
-                    writeln!(serialbuf, "heading: {}", heading.round()).unwrap();
-                    transmit_uart_data(
-                        uart_data.as_mut().unwrap(),
-                        serialbuf);
+                    // Confirm theta == ref_theta from last iteration
+                    // otherwise go back to first iteration
+                    if theta.round() != ref_theta.round() {
+                        AUTO_FIRST_ITER.borrow(cs).set(true);
+                    }
+
+                    if AUTO_FIRST_ITER.borrow(cs).get() {
+                        // Tilt to face up for accurate heading readings
+                        tilt_angle = 90.;
+                        position_kit_tilt(pwm2, &mut tilt_angle);
+                        
+                        delay.delay_ms(250);// wait for tilt kit to arrive at 90 deg
+                        
+                        // Get the magnetic heading
+                        heading = get_magnetic_heading(&mut i2c0);
+
+                        writeln!(serialbuf, "heading: {} deg.\ntilt: {} deg.",
+                                 heading.round(), &mut tilt_angle).unwrap();
+                        transmit_uart_data(
+                            uart_data.as_mut().unwrap(),
+                            serialbuf);
+                    } else {
+                        heading = get_magnetic_heading(&mut i2c0);// get the adjusted magnetic heading i.e. at a tilt
+                        theta = adjusted_theta;// we'll now track adjusted theta since we're at a tilt
+
+                        writeln!(serialbuf, "adjusted theta: {} deg.\ntilt: {} deg.",
+                                 heading.round(), &mut tilt_angle).unwrap();
+                        transmit_uart_data(
+                            uart_data.as_mut().unwrap(),
+                            serialbuf);
+                    }
+
+                    // Pan moded servo cw while heading != theta i.e.
+                    // Dish is not locked with theta
+                    while !heading_within_range(theta, heading) {
+                        if pan_clockwise(theta, heading) {
+                            pan(&mut delay, sio.as_mut().unwrap(), Direction::Cw);
+
+                            heading = get_magnetic_heading(&mut i2c0);
+                        
+                            writeln!(serialbuf, "Pan Cw: {} --> {}",
+                                     heading.round(), theta.round()).unwrap();
+                            transmit_uart_data(
+                                uart_data.as_mut().unwrap(),
+                                serialbuf);
+                        } else {
+                            pan(&mut delay, sio.as_mut().unwrap(), Direction::Ccw);
+
+                            heading = get_magnetic_heading(&mut i2c0);
+
+                            writeln!(serialbuf, "Pan Ccw: {} --> {}",
+                                     heading.round(), theta.round()).unwrap();
+                            transmit_uart_data(
+                                uart_data.as_mut().unwrap(),
+                                serialbuf);
+                        }
+                    }
+
+                    // ...then tilt to lock with the azimuth, phi
+                    while tilt_angle.round() != phi.round() {
+                        if tilt_up(phi, tilt_angle) {
+                            tilt(pwm2, &mut delay, &mut tilt_angle, Direction::Up);
+                            
+                            writeln!(serialbuf, "Tilt +: {} --> {}",
+                                     &mut tilt_angle.round(), phi.round()).unwrap();
+                            transmit_uart_data(
+                                uart_data.as_mut().unwrap(),
+                                serialbuf);
+                        } else {
+                            tilt(pwm2, &mut delay, &mut tilt_angle, Direction::Down);
+
+                            writeln!(serialbuf, "Tilt -: {} --> {}", 
+                                     &mut tilt_angle.round(), phi.round()).unwrap();
+                            transmit_uart_data(
+                                uart_data.as_mut().unwrap(),
+                                serialbuf);
+                        }
+                    }
+
+                    if AUTO_FIRST_ITER.borrow(cs).get() {
+                        delay.delay_ms(100);// settle before getting adjusted_theta
+                        
+                        // Get the adjusted magnetic heading i.e.
+                        // heading with system tilted
+                        heading = get_magnetic_heading(&mut i2c0);
+                        adjusted_theta = heading; 
+
+                        // Keep theta for reference
+                        ref_theta = theta;
+
+                        AUTO_FIRST_ITER.borrow(cs).set(false);// clear flag
+                    }
+
+                    GGA_ACQUIRED.borrow(cs).set(false);// clear the flag
                 }
             } else {
                 // Manual mode
@@ -444,6 +518,12 @@ fn main() -> ! {
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
 
                         pan(&mut delay, sio.as_mut().unwrap(), Direction::Cw);
+                        
+                        heading = get_magnetic_heading(&mut i2c0);
+                        writeln!(serialbuf, "Heading: {}", heading.round()).unwrap();
+                        transmit_uart_data(
+                            uart_data.as_mut().unwrap(),
+                            serialbuf);
                     },
                     Some(Direction::Ccw) => {
                         *direction = None;
@@ -451,6 +531,12 @@ fn main() -> ! {
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
 
                         pan(&mut delay, sio.as_mut().unwrap(), Direction::Ccw);
+
+                        heading = get_magnetic_heading(&mut i2c0);
+                        writeln!(serialbuf, "Heading: {}", heading.round()).unwrap();
+                        transmit_uart_data(
+                            uart_data.as_mut().unwrap(),
+                            serialbuf);
                     },
                     Some(Direction::Up) => {
                         *direction = None;
@@ -476,6 +562,32 @@ fn main() -> ! {
                         *direction = None;
                         writeln!(serialbuf, "manual mode: position zero").unwrap();
                         transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
+
+                        // Face 0° and look up
+                        tilt_angle = 90.;
+                        position_kit_tilt(pwm2, &mut tilt_angle);
+                        
+                        delay.delay_ms(250);// wait for tilt kit to arrive at 90 deg
+
+                        heading = get_magnetic_heading(&mut i2c0);
+
+                        theta = 0.;
+
+                        while !heading_within_range(theta, heading) {
+                            if pan_clockwise(theta, heading) {
+                                pan(&mut delay, sio.as_mut().unwrap(), Direction::Cw);
+                            
+                                heading = get_magnetic_heading(&mut i2c0);
+                            } else {
+                                pan(&mut delay, sio.as_mut().unwrap(), Direction::Ccw);
+                            
+                                heading = get_magnetic_heading(&mut i2c0);
+                            }
+                        }
+                            
+                        writeln!(serialbuf, "heading: {}   tilt angle: {}", 
+                                 heading.round(), tilt_angle).unwrap();
+                        transmit_uart_data(uart_data.as_mut().unwrap(), serialbuf);
                     },
                     None => {},
                 }
@@ -486,27 +598,52 @@ fn main() -> ! {
     }
 }
 
+fn tilt_up(phi: f32, tilt_angle: f32) -> bool {
+    let tilt = phi - tilt_angle;
+
+    tilt < 0.
+}
+
+fn heading_within_range(theta: f32, heading: f32) -> bool {
+    // checks whether heading is +/- 2 of desired pan angle
+    heading.round() == theta.round() || heading.round() == theta.round() - 1. 
+        || heading.round() == theta.round() - 2.
+        || heading.round() == theta.round() + 1.
+        || heading.round() == theta.round() + 2.
+}
+
+fn pan_clockwise(theta: f32, heading: f32) -> bool {
+    // Check if pan sd be cw or ccw 
+    let pan = theta - heading;
+
+    if pan.abs() < 180. {
+        pan > 0.
+    } else {
+        pan < 0.
+    }
+}
+
 fn pan(delay: &mut Delay, sio: &mut SIO, direction: Direction) {
     match direction {
         Direction::Cw => {
-	    // Move servo CW: Relay 1 ON, Relay 2 OFF
-	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() | 1 << 16)});// Set pin 16 high
+            // Move servo CW: Relay 1 ON, Relay 2 OFF
+            sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() | 1 << 16)});// Set pin 16 high
 
-	    delay.delay_ms(10);// delay
+            delay.delay_ms(10);// delay
 
-	    // Put servo OFF
-	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 16))});// Set pin 16 low
-	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 17))});// Set pin 17 low
+            // Put servo OFF
+            sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 16))});// Set pin 16 low
+            sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 17))});// Set pin 17 low
         },
         Direction::Ccw => {
-	    // Move servo CCW: Relay 2 ON, Relay 1 OFF
-	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() | 1 << 17)});// Set pin 17 high
+            // Move servo CCW: Relay 2 ON, Relay 1 OFF
+            sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() | 1 << 17)});// Set pin 17 high
 
-	    delay.delay_ms(10);// delay
+            delay.delay_ms(10);// delay
 
-	    // Put servo OFF
-	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 16))});// Set pin 16 low
-	    sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 17))});// Set pin 17 low
+            // Put servo OFF
+            sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 16))});// Set pin 16 low
+            sio.gpio_out().modify(|r, w| unsafe { w.bits(r.gpio_out().bits() & !(1 << 17))});// Set pin 17 low
         },
         _ => {},
     }
@@ -542,7 +679,7 @@ fn position_kit_tilt(pwm: &CH, tilt_angle: &mut f32) {
 }
 
 pub fn sweep(pwm: &CH, mut degrees: u16) {
-    const BASE: u16 = 1500;// here pwm at position 0 degrees
+    const BASE: u16 = 1400;// here pwm at position 0 degrees
 
     degrees = BASE + (degrees * 28);// ~28: movt by 1 degree 
     unsafe {
@@ -556,7 +693,7 @@ fn receive_uart_cmd(uart: &UART1) -> u8 {// receive 1 byte
     uart.uartdr().read().data().bits()// Received data
 }
 
-fn transmit_uart_cmd(uart: &UART1, buffer: &mut String<164>) {
+fn _transmit_uart_cmd(uart: &UART1, buffer: &mut String<164>) {
     for ch in buffer.chars() {
         uart.uartdr().modify(|_, w| unsafe { w.data().bits(ch as u8)});// Send data
         while uart.uartfr().read().busy().bit_is_set()  {}// Wait until tx finished
@@ -891,7 +1028,7 @@ fn get_magnetic_heading(i2c0: &mut I2C0) -> f32 {
         let _z = ((z_h << 8) + z_l) as i16;
 
         // North-Clockwise convention for getting the heading
-        let mut heading = (y as f32 + 185.).atan2(x as f32 + 75.);
+        let mut heading = (y as f32 - 75.).atan2(x as f32 + 75.);
 
         heading += MAGNETIC_DECLINATION*(PI/180.);// add declination in radians
 
