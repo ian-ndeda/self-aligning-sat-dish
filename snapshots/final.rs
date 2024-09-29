@@ -349,16 +349,16 @@ fn main() -> ! {
 
     sio.gpio_oe().modify(|r, w| unsafe { w.bits(r.gpio_oe().bits() | 1 << 17)});// Output enable for pin 17
 
-    // Test 
-    writeln!(serialbuf, "\nSelf-Aligning Satellite Dish in Rust\n").unwrap();
-    transmit_uart_data(&uart_data, serialbuf);
-
     // Delay handle
     let mut delay = Delay::new(cp.SYST, 125_000_000);
 
     // Buffers
     let gpsbuf = String::new();// buffer to hold gps data
     let serialbuf = &mut String::<164>::new();// buffer to hold data to be serially transmitted
+
+    // Test 
+    writeln!(serialbuf, "\nSelf-Aligning Satellite Dish in Rust\n").unwrap();
+    transmit_uart_data(&uart_data, serialbuf);
 
     configure_compass(&mut i2c0, &uart_data);
 
@@ -409,7 +409,7 @@ fn main() -> ! {
                         position.long,
                         position.alt);
 
-                    writeln!(serialbuf, "theta: {}  phi: {}", theta, phi).unwrap();
+                    writeln!(serialbuf, "\ntheta: {}  phi: {}", theta, phi).unwrap();
                     transmit_uart_data(
                         uart_data.as_mut().unwrap(),
                         serialbuf);
@@ -430,16 +430,22 @@ fn main() -> ! {
                         // Get the magnetic heading
                         heading = get_magnetic_heading(&mut i2c0);
 
-                        writeln!(serialbuf, "heading: {} deg.\ntilt: {} deg.",
+                        writeln!(serialbuf, "> heading: {} deg.\n> tilt: {} deg.",
                                  heading.round(), &mut tilt_angle).unwrap();
                         transmit_uart_data(
                             uart_data.as_mut().unwrap(),
                             serialbuf);
                     } else {
-                        heading = get_magnetic_heading(&mut i2c0);// get the adjusted magnetic heading i.e. at a tilt
+                        let tilted_heading = get_magnetic_heading(&mut i2c0);// get the adjusted magnetic heading i.e. at a tilt
+                        heading = tilted_heading;
                         theta = adjusted_theta;// we'll now track adjusted theta since we're at a tilt
 
-                        writeln!(serialbuf, "adjusted theta: {} deg.\ntilt: {} deg.",
+                        writeln!(serialbuf, "adjusted theta: {} deg.", theta).unwrap();
+                        transmit_uart_data(
+                            uart_data.as_mut().unwrap(),
+                            serialbuf);
+
+                        writeln!(serialbuf, "> tilted heading: {} deg.\n> tilt: {} deg.",
                                  heading.round(), &mut tilt_angle).unwrap();
                         transmit_uart_data(
                             uart_data.as_mut().unwrap(),
@@ -994,7 +1000,7 @@ fn configure_compass(i2c0: &mut I2C0, uart: &UART0) { // Configure and confirm H
     transmit_uart_data(uart, serialbuf);
 
     if (cfg_a == 0b01110000) && (cfg_b == 0b00100000)   { 
-        writeln!(serialbuf, "cfg regs set.").unwrap();
+        writeln!(serialbuf, "cfg regs set.\n").unwrap();
         transmit_uart_data(uart, serialbuf);
     }
 }
