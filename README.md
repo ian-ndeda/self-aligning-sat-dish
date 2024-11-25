@@ -1,15 +1,6 @@
 ![banner](https://github.com/user-attachments/assets/89325875-c7e3-45df-8fd2-01137fd0d1c4)
 
 # Self-Aligning Satellite Dish
-## Table of Contents
-- [Introduction](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#introduction)
-- [Flowchart](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#flowchart)
-- [Requirements](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file.md#requirements)
-- [Connections](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#connections)
-- [Serial Bluetooth App](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#serial-bluetooth-app)
-- [Results](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#results)
-- [Recommndations](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file.md#recommendations)
-
 
 ## Introduction
 
