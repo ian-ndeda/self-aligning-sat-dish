@@ -2,13 +2,13 @@
 
 # Self-Aligning Satellite Dish
 ## Table of Contents
-- [Introduction](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#introduction)
-- [Flowchart](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#flowchart)
-- [Requirements](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#requirements)
-- [Connections](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#connections)
-- [Serial Bluetooth App](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#serial-bluetooth-app)
-- [Results](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#results)
-- [Recommndations](https://github.com/ian-ndeda/self-aligning-sat-dish/main?filename=README.md#recommendations)
+- [Introduction](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#introduction)
+- [Flowchart](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#flowchart)
+- [Requirements](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file.md#requirements)
+- [Connections](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#connections)
+- [Serial Bluetooth App](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#serial-bluetooth-app)
+- [Results](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file#results)
+- [Recommndations](https://github.com/ian-ndeda/self-aligning-sat-dish/tree/main?tab=readme-ov-file.md#recommendations)
 
 
 ## Introduction
